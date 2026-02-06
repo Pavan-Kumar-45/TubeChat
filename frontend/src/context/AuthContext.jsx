@@ -1,40 +1,35 @@
 import { createContext, useContext, useState, useEffect } from 'react';
-import { authService } from '../services/api';
+import { auth as authApi } from '../lib/api';
 
-const AuthContext = createContext(null);
+const Ctx = createContext(null);
 
-export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
+/**
+ * Provides authentication state (user, loading) and actions (login, register, logout)
+ * to all child components via React context.
+ */
+export function AuthProvider({ children }) {
+  const [user, setUser]       = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const initAuth = async () => {
-      const token = localStorage.getItem('token');
-      if (token) {
-        try {
-          const userData = await authService.getCurrentUser();
-          setUser(userData);
-        } catch (error) {
-          console.error("Auth check failed", error);
-          localStorage.removeItem('token');
-        }
-      }
-      setLoading(false);
-    };
-    initAuth();
+    const token = localStorage.getItem('token');
+    if (!token) { setLoading(false); return; }
+    authApi.me()
+      .then(setUser)
+      .catch(() => localStorage.removeItem('token'))
+      .finally(() => setLoading(false));
   }, []);
 
   const login = async (username, password) => {
-    const data = await authService.login(username, password);
+    const data = await authApi.login({ username, password });
     localStorage.setItem('token', data.access_token);
-    const userData = await authService.getCurrentUser();
-    setUser(userData);
-    return userData;
+    const me = await authApi.me();
+    setUser(me);
+    return me;
   };
 
-  const register = async (username, password) => {
-    return await authService.register(username, password);
-  };
+  const register = (username, password) =>
+    authApi.register({ username, password });
 
   const logout = () => {
     localStorage.removeItem('token');
@@ -42,10 +37,11 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, login, register, logout, loading }}>
+    <Ctx.Provider value={{ user, loading, login, register, logout }}>
       {children}
-    </AuthContext.Provider>
+    </Ctx.Provider>
   );
-};
+}
 
-export const useAuth = () => useContext(AuthContext);
+/** Hook to access authentication context (user, login, register, logout). */
+export const useAuth = () => useContext(Ctx);

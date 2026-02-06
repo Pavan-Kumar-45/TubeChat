@@ -1,49 +1,65 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ThemeProvider } from './context/ThemeContext';
-import { Layout } from './components/Layout';
-import { ChatInterface } from './components/ChatInterface';
-import { Login } from './pages/Login';
-import { Register } from './pages/Register';
+import { ChatProvider } from './context/ChatContext';
 
-const PrivateRoute = ({ children }) => {
+import AppLayout from './layouts/AppLayout';
+import HomePage from './pages/HomePage';
+import ChatPage from './pages/ChatPage';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+
+/* ── Route guards ── */
+/**
+ * Route guard that redirects unauthenticated users to /login.
+ * Shows a spinner while auth state is loading.
+ */
+function RequireAuth({ children }) {
   const { user, loading } = useAuth();
-  
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-white dark:bg-slate-950 flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <div className="w-16 h-16 border-4 border-primary-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
-          <p className="text-slate-600 dark:text-slate-400 font-medium">Loading...</p>
-        </div>
-      </div>
-    );
-  }
-  
-  return user ? children : <Navigate to="/login" />;
-};
+  if (loading) return (
+    <div className="h-screen flex items-center justify-center bg-[var(--color-bg)]">
+      <div className="w-6 h-6 border-2 border-[var(--color-accent)] border-t-transparent rounded-full animate-spin" />
+    </div>
+  );
+  return user ? children : <Navigate to="/login" replace />;
+}
 
-function App() {
+/**
+ * Route guard that redirects authenticated users to /.
+ * Allows only unauthenticated access.
+ */
+function GuestOnly({ children }) {
+  const { user, loading } = useAuth();
+  if (loading) return null;
+  return user ? <Navigate to="/" replace /> : children;
+}
+
+/**
+ * Root application component. Sets up providers (Theme, Auth, Chat)
+ * and defines all routes with auth guards.
+ */
+export default function App() {
   return (
     <ThemeProvider>
       <AuthProvider>
-        <BrowserRouter>
-          <Routes>
-            <Route path="/login" element={<Login />} />
-            <Route path="/register" element={<Register />} />
-            
-            <Route path="/" element={
-               <PrivateRoute>
-                  <Layout />
-               </PrivateRoute>
-            }>
-               <Route index element={<ChatInterface />} />
-            </Route>
-          </Routes>
-        </BrowserRouter>
+        <ChatProvider>
+          <BrowserRouter>
+            <Routes>
+              {/* Auth */}
+              <Route path="/login"    element={<GuestOnly><LoginPage /></GuestOnly>} />
+              <Route path="/register" element={<GuestOnly><RegisterPage /></GuestOnly>} />
+
+              {/* App */}
+              <Route element={<RequireAuth><AppLayout /></RequireAuth>}>
+                <Route index element={<HomePage />} />
+                <Route path="/chat/:id" element={<ChatPage />} />
+              </Route>
+
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </BrowserRouter>
+        </ChatProvider>
       </AuthProvider>
     </ThemeProvider>
   );
 }
-
-export default App;

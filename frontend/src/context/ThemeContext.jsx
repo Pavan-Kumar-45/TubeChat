@@ -1,32 +1,28 @@
-import { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useEffect, useState } from 'react';
 
-const ThemeContext = createContext(null);
+const Ctx = createContext(null);
 
-export const ThemeProvider = ({ children }) => {
-  const [theme, setTheme] = useState(() => {
+/**
+ * Provides dark/light theme state and a toggle function.
+ * Persists the preference to localStorage and syncs with the `dark` CSS class.
+ */
+export function ThemeProvider({ children }) {
+  const [dark, setDark] = useState(() => {
+    if (typeof window === 'undefined') return true;
     const saved = localStorage.getItem('theme');
-    return saved || 'dark';
+    if (saved) return saved === 'dark';
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
   });
 
   useEffect(() => {
-    const root = window.document.documentElement;
-    if (theme === 'dark') {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
-    }
-    localStorage.setItem('theme', theme);
-  }, [theme]);
+    document.documentElement.classList.toggle('dark', dark);
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+  }, [dark]);
 
-  const toggleTheme = () => {
-    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
-  };
+  const toggle = () => setDark(d => !d);
 
-  return (
-    <ThemeContext.Provider value={{ theme, toggleTheme }}>
-      {children}
-    </ThemeContext.Provider>
-  );
-};
+  return <Ctx.Provider value={{ dark, toggle }}>{children}</Ctx.Provider>;
+}
 
-export const useTheme = () => useContext(ThemeContext);
+/** Hook to access theme context (dark, toggle). */
+export const useTheme = () => useContext(Ctx);

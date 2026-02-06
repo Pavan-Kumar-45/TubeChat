@@ -1,5 +1,5 @@
 from fastapi import Depends, HTTPException, status, APIRouter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -28,21 +28,58 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
 
 def verify_password(plain_password, hashed_password):
+    """Verify a plain-text password against its bcrypt hash.
+
+    Args:
+        plain_password: The raw password to check.
+        hashed_password: The stored bcrypt hash.
+
+    Returns:
+        True if the password matches, False otherwise.
+    """
     return pwd_context.verify(plain_password, hashed_password)
 
 
 def get_password_hash(password):
+    """Hash a plain-text password using bcrypt.
+
+    Args:
+        password: The raw password to hash.
+
+    Returns:
+        The bcrypt-hashed password string.
+    """
     return pwd_context.hash(password)
 
 
 def create_access_token(data: dict):
+    """Create a JWT access token with an expiration claim.
+
+    Args:
+        data: Payload dict (must include 'sub' for the username).
+
+    Returns:
+        Encoded JWT string.
+    """
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """Decode JWT token and return the authenticated User ORM object.
+
+    Args:
+        token: Bearer token extracted from the Authorization header.
+        db: Database session (injected).
+
+    Returns:
+        The SQLAlchemy User instance for the authenticated user.
+
+    Raises:
+        HTTPException 401: If the token is invalid or the user doesn't exist.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -59,9 +96,6 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if user is None:
         raise credentials_exception
     return user
-
-
- 
 
 
 @router.post("/register")

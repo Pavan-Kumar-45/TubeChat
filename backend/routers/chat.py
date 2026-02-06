@@ -1,29 +1,70 @@
-from fastapi import APIRouter, Depends, HTTPException, HTTPException, status
-from requests import Session
-from rpds import List
-from backend import db
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 from backend.db import get_db
-from backend.models import CreateChat, ReturnChat, UpdateName
+from backend.models import CreateChat, ReturnChat, UpdateName, ReturnMessage
 from backend.routers.auth import get_current_user
-from backend.schemas import Chat
+from backend.schemas import Chat, Message
 from pytubefix import YouTube
 from pytubefix.exceptions import VideoUnavailable, VideoPrivate
 import requests
-
+import json
 
 
 router = APIRouter(
     prefix="/chat",
     tags=["chat"],
 )
-video_info = {}
-def is_valid_youtube_url(url: str) -> bool:
+
+# In-memory cache so we don't re-fetch YouTube metadata within the same process
+_video_info_cache: dict[str, dict] = {}
+
+
+def get_video_info(url: str) -> dict:
+    """Fetch YouTube video metadata, returning cached results when available.
+
+    Args:
+        url: YouTube video URL.
+
+    Returns:
+        Dict with 'title', 'author', and 'thumbnail_url' keys.
+    """
+    if url in _video_info_cache:
+        return _video_info_cache[url]
+
     try:
         yt = YouTube(url)
-        video_info[url] = {
+        _video_info_cache[url] = {
             "title": yt.title,
             "author": yt.author,
-            "thumbnail_url": yt.thumbnail_url
+            "thumbnail_url": yt.thumbnail_url,
+        }
+        return _video_info_cache[url]
+    except Exception as e:
+        print(f"Error fetching video info for {url}: {e}")
+        return {
+            "title": "Video Unavailable",
+            "author": "Unknown",
+            "thumbnail_url": "",
+        }
+
+
+def is_valid_youtube_url(url: str) -> bool:
+    """Validate a YouTube URL by attempting to access the video.
+
+    Also populates the video info cache on success.
+
+    Args:
+        url: YouTube video URL to validate.
+
+    Returns:
+        True if the video is accessible, False otherwise.
+    """
+    try:
+        yt = YouTube(url)
+        _video_info_cache[url] = {
+            "title": yt.title,
+            "author": yt.author,
+            "thumbnail_url": yt.thumbnail_url,
         }
         return True
     except VideoUnavailable:
@@ -39,152 +80,235 @@ def is_valid_youtube_url(url: str) -> bool:
         print(f"An unexpected error occurred: {e}")
         return False
 
+
+def _chat_to_return(chat: Chat) -> ReturnChat:
+    """Convert a Chat ORM object to a ReturnChat response model.
+
+    Uses stored DB fields — never calls the YouTube API.
+
+    Args:
+        chat: SQLAlchemy Chat instance.
+
+    Returns:
+        Populated ReturnChat pydantic model.
+    """
+    return ReturnChat(
+        id=chat.id,
+        name=chat.name or chat.title or "Untitled",
+        url=chat.url,
+        title=chat.title,
+        author=chat.author,
+        thumbnail_url=chat.thumbnail_url,
+        created_at=chat.created_at,
+        last_session=chat.last_session,
+    )
+
  
 
 @router.post("/create", response_model=ReturnChat, status_code=status.HTTP_201_CREATED)
-def create_chat(chat: CreateChat, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def create_chat(
+    chat: CreateChat,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new chat session for a YouTube video.
+
+    Validates the URL, fetches video metadata, and persists the chat.
+
+    Args:
+        chat: Request body with YouTube URL and optional name.
+        user: Authenticated user (injected).
+        db: Database session (injected).
+
+    Returns:
+        The newly created chat as ReturnChat.
+
+    Raises:
+        HTTPException 400: If the YouTube URL is invalid or inaccessible.
+    """
     if not is_valid_youtube_url(chat.url):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid YouTube URL"
+            detail="Invalid YouTube URL",
         )
-    
-    yt_info = video_info[chat.url]
-    
-    # Use video title as default name if not provided
+
+    yt_info = _video_info_cache[chat.url]
     chat_name = chat.name if chat.name else yt_info["title"]
-    
+
     new_chat = Chat(
         name=chat_name,
         url=chat.url,
         user_id=user.id,
         title=yt_info["title"],
-        thumbnail_url=yt_info["thumbnail_url"]
+        author=yt_info["author"],
+        thumbnail_url=yt_info["thumbnail_url"],
     )
     db.add(new_chat)
     db.commit()
     db.refresh(new_chat)
 
-    return ReturnChat(
-        id=new_chat.id,
-        name=new_chat.name,
-        url=new_chat.url,
-        title=yt_info["title"],
-        author=yt_info["author"],
-        thumbnail_url=yt_info["thumbnail_url"],
-        created_at=new_chat.created_at,
-        last_session=new_chat.last_session
-    )
+    return _chat_to_return(new_chat)
 
-@router.get("/list", response_model=list[ReturnChat],status_code=status.HTTP_200_OK)
-def list_chats(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    chats = db.query(Chat).filter(Chat.user_id == user.id).order_by(Chat.last_session.desc()).all()
-    result = []
-    for chat in chats:
-        yt_info = video_info[chat.url]
-        result.append(ReturnChat(
-            id=chat.id,
-            name=chat.name,
-            url=chat.url,
-            title=yt_info["title"],
-            author=yt_info["author"],
-            thumbnail_url=yt_info["thumbnail_url"],
-            created_at=chat.created_at,
-            last_session=chat.last_session
-        ))
-    return result 
+
+@router.get("/list", response_model=list[ReturnChat], status_code=status.HTTP_200_OK)
+def list_chats(
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List all chats for the authenticated user, ordered by last session.
+
+    Uses stored DB fields — no external API calls, so this is fast.
+
+    Args:
+        user: Authenticated user (injected).
+        db: Database session (injected).
+
+    Returns:
+        List of ReturnChat models.
+    """
+    chats = (
+        db.query(Chat)
+        .filter(Chat.user_id == user.id)
+        .order_by(Chat.last_session.desc())
+        .all()
+    )
+    return [_chat_to_return(c) for c in chats]
 
 @router.delete("/delete/{chat_id}", status_code=status.HTTP_200_OK)
-def delete_chat(chat_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_chat(
+    chat_id: int,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a chat and all its messages.
+
+    Args:
+        chat_id: ID of the chat to delete.
+        user: Authenticated user (injected).
+        db: Database session (injected).
+
+    Returns:
+        Success confirmation message.
+
+    Raises:
+        HTTPException 404: If chat not found or not owned by user.
+    """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found"
+            detail="Chat not found",
         )
-    else:
-        db.delete(chat)
-        db.commit()
-        return {"message": "Chat deleted successfully"} 
+    db.delete(chat)
+    db.commit()
+    return {"message": "Chat deleted successfully"}
+
     
 @router.get("/get/{chat_id}", response_model=ReturnChat, status_code=status.HTTP_200_OK)
-def get_chat(chat_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def get_chat(
+    chat_id: int,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get a single chat by ID.
+
+    Args:
+        chat_id: ID of the chat.
+        user: Authenticated user (injected).
+        db: Database session (injected).
+
+    Returns:
+        ReturnChat model for the requested chat.
+
+    Raises:
+        HTTPException 404: If chat not found or not owned by user.
+    """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found"
+            detail="Chat not found",
         )
-    yt_info = video_info[chat.url]
-    return ReturnChat(
-        id=chat.id,
-        name=chat.name,
-        url=chat.url,
-        title=yt_info["title"],
-        author=yt_info["author"],
-        thumbnail_url=yt_info["thumbnail_url"],
-        created_at=chat.created_at,
-        last_session=chat.last_session
+    return _chat_to_return(chat)
+
+
+@router.get("/{chat_id}/messages", response_model=list[ReturnMessage], status_code=status.HTTP_200_OK)
+def get_messages(
+    chat_id: int,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get all messages for a chat, ordered chronologically.
+
+    Args:
+        chat_id: ID of the chat.
+        user: Authenticated user (injected).
+        db: Database session (injected).
+
+    Returns:
+        List of ReturnMessage models.
+
+    Raises:
+        HTTPException 404: If chat not found or not owned by user.
+    """
+    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+
+    msgs = (
+        db.query(Message)
+        .filter(Message.chat_id == chat_id)
+        .order_by(Message.created_at.asc())
+        .all()
     )
+    result = []
+    for m in msgs:
+        follow_up: list[str] = []
+        if m.follow_up:
+            try:
+                follow_up = json.loads(m.follow_up)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        result.append(
+            ReturnMessage(
+                id=m.id,
+                role=m.role,
+                content=m.content,
+                follow_up=follow_up,
+                created_at=m.created_at,
+            )
+        )
+    return result
 
-
-@router.post("/{chat_id}/message")
-async def send_message(chat_id: int, user_input: dict, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    """Send a message and get AI response - uses the graph agent"""
-    from backend.graph import get_chat_graph
-    from backend.models import Output
-    from langchain_core.messages import HumanMessage
-    
-    # Validate chat ownership
-    chat_obj = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
-    if not chat_obj:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    
-    # Get the graph for this URL
-    app = get_chat_graph(chat_id=chat_id, url=chat_obj.url)
-    question = user_input.get("question") or user_input.get("message")
-    
-    config = {"configurable": {"thread_id": str(chat_id)}}
-    inputs = {"messages": [HumanMessage(content=question)], "question": question}
-    
-    # Run the graph and get the final state
-    final_state = app.invoke(inputs, config=config)
-    messages = final_state.get('messages', [])
-    
-    if messages:
-        response_content = messages[-1].content
-        # Parse if it's JSON
-        try:
-            import json
-            response_data = json.loads(response_content)
-            # Add video title from stored info
-            if chat_obj.url in video_info:
-                response_data["title"] = video_info[chat_obj.url]["title"]
-            return response_data
-        except:
-            return {"answer": response_content, "follow_up": []}
-    
-    return {"answer": "Sorry, I couldn't process that.", "follow_up": []}
 
 @router.put("/update_name/{chat_id}", response_model=ReturnChat, status_code=status.HTTP_200_OK)
-def update_chat_name(chat_id: int, new_name: UpdateName, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def update_chat_name(
+    chat_id: int,
+    new_name: UpdateName,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rename a chat.
+
+    Args:
+        chat_id: ID of the chat to rename.
+        new_name: Request body with the new name.
+        user: Authenticated user (injected).
+        db: Database session (injected).
+
+    Returns:
+        Updated ReturnChat model.
+
+    Raises:
+        HTTPException 404: If chat not found or not owned by user.
+    """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found"
+            detail="Chat not found",
         )
     chat.name = new_name.name
     db.commit()
     db.refresh(chat)
-    yt_info = video_info[chat.url]
-    return ReturnChat(
-        id=chat.id,
-        name=chat.name,
-        url=chat.url,
-        title=yt_info["title"],
-        author=yt_info["author"],
-        thumbnail_url=yt_info["thumbnail_url"],
-        created_at=chat.created_at,
-        last_session=chat.last_session
-    )       
+    return _chat_to_return(chat)

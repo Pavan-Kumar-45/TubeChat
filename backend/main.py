@@ -30,9 +30,11 @@ app.include_router(stream.router)
 
 @app.get("/")
 def root():
+    """Root endpoint returning a welcome message."""
     return {"message": "Welcome to Youtube RAG API"}
 
 
 @app.get("/health")
 def health_check():
+    """Health check endpoint for monitoring."""
     return {"status": "healthy"}
