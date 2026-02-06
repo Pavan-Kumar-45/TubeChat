@@ -8,7 +8,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=black)](https://react.dev)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.0-1c3c3c?logo=langchain&logoColor=white)](https://langchain-ai.github.io/langgraph/)
-[![Gemini](https://img.shields.io/badge/Gemini-2.5--flash--lite-4285f4?logo=google&logoColor=white)](https://ai.google.dev)
+[![Gemini](https://img.shields.io/badge/Google%20Gemini-AI-4285f4?logo=google&logoColor=white)](https://ai.google.dev)
 
 Paste a YouTube URL → AI extracts the transcript → Ask anything about the video
 
@@ -61,7 +61,7 @@ Paste a YouTube URL → AI extracts the transcript → Ask anything about the vi
 │                                      │                   │
 │                              GENERATE_ANSWER → END       │
 │                                                          │
-│  Gemini 2.5-flash-lite · ChromaDB · Tavily Search        │
+│  Google Gemini · ChromaDB · Tavily Search                │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -201,8 +201,8 @@ Open **http://localhost:5173** in your browser.
 | FastAPI | REST API framework |
 | LangGraph | Multi-node AI agent pipeline |
 | LangChain | LLM orchestration & document loading |
-| Google Gemini 2.5-flash-lite | LLM for generation & evaluation |
-| Gemini Embedding 001 | Text embeddings |
+| Google Gemini | LLM for generation & evaluation |
+| Google Gemini Embeddings | Text embeddings |
 | ChromaDB | Vector store for transcript chunks |
 | Tavily Search | Web search fallback |
 | SQLAlchemy + PyMySQL | ORM & MySQL connection |
