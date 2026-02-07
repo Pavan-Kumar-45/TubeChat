@@ -18,19 +18,35 @@ router = APIRouter(
 _video_info_cache: dict[str, dict] = {}
 
 def get_video_id(url: str) -> str | None:
-    """
-    Robust Regex to extract 11-char Video ID from ANY YouTube URL.
-    Supports: shorts, live, embed, youtu.be, standard watch?v=
-    """
-    # This regex looks for 11 chars that follow: v=, /, embed/, be/, shorts/, or live/
+    """Extract 11-char Video ID from ANY YouTube URL."""
     pattern = r'(?:v=|\/|embed\/|youtu\.be\/|shorts\/|live\/)([0-9A-Za-z_-]{11})'
     match = re.search(pattern, url)
     if match:
         return match.group(1)
     return None
 
+def fetch_metadata_oembed(url: str) -> dict | None:
+    """
+    Strategy 1: YouTube oEmbed API (The Silver Bullet).
+    This endpoint is public and rarely blocked because it powers embeds on Twitter/Discord.
+    """
+    try:
+        # We ask for JSON format. 
+        oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+        response = requests.get(oembed_url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "title": data.get("title", "YouTube Video"),
+                "author": data.get("author_name", "Unknown Author"),
+                "thumbnail_url": data.get("thumbnail_url", "")
+            }
+    except Exception as e:
+        print(f"⚠️ oEmbed failed: {e}")
+    return None
+
 def fetch_metadata_piped(video_id: str) -> dict | None:
-    """Fetch metadata from Piped API (Bypasses IP blocks)."""
+    """Strategy 3: Piped API (Public Proxy)."""
     try:
         response = requests.get(f"https://pipedapi.kavin.rocks/streams/{video_id}", timeout=5)
         if response.status_code == 200:
@@ -45,7 +61,7 @@ def fetch_metadata_piped(video_id: str) -> dict | None:
     return None
 
 def get_yt_metadata(url: str) -> dict | None:
-    """Fetch metadata using yt-dlp (Standard method)."""
+    """Strategy 2: yt-dlp (Standard)."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -69,39 +85,39 @@ def get_yt_metadata(url: str) -> dict | None:
 def is_valid_youtube_url(url: str) -> bool:
     """
     Validate URL using a 'Waterfall' strategy:
-    1. Cache -> 2. yt-dlp -> 3. Piped API -> 4. Manual Fallback
+    1. Cache -> 2. oEmbed -> 3. yt-dlp -> 4. Piped API -> 5. Fallback
     """
     if url in _video_info_cache:
         return True
 
-    # Attempt 1: Try yt-dlp first (Most accurate)
-    metadata = get_yt_metadata(url)
-
-    # Attempt 2: If yt-dlp failed, try Piped API (Requires Video ID)
-    if not metadata:
-        video_id = get_video_id(url)
-        if video_id:
-            print(f"🔄 yt-dlp failed, trying Piped API for {video_id}...")
-            metadata = fetch_metadata_piped(video_id)
+    video_id = get_video_id(url)
     
-    # Attempt 3: If Piped failed, use Manual Fallback (Requires Video ID)
+    # Attempt 1: oEmbed (Best for Cloud IPs)
+    metadata = fetch_metadata_oembed(url)
+
+    # Attempt 2: yt-dlp
     if not metadata:
-        video_id = get_video_id(url) or get_video_id(url) # Retry ID extraction
+        metadata = get_yt_metadata(url)
+
+    # Attempt 3: Piped API (If both failed)
+    if not metadata and video_id:
+        print(f"🔄 Switching to Piped API for {video_id}...")
+        metadata = fetch_metadata_piped(video_id)
+    
+    # Attempt 4: Manual Fallback
+    if not metadata:
         if video_id:
-            print(f"⚠️ Metadata fetch failed. Using manual fallback for {url}")
+            print(f"⚠️ All metadata fetches failed. Using manual fallback for {url}")
             metadata = {
                 "title": "YouTube Video (Metadata Hidden)",
                 "author": "Unknown",
                 "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg",
             }
+        else:
+            return False # No ID extracted, so it's invalid.
     
-    # Success? Save to cache.
-    if metadata:
-        _video_info_cache[url] = metadata
-        return True
-    
-    # If we still have no metadata and no ID, it's truly invalid.
-    return False
+    _video_info_cache[url] = metadata
+    return True
 
 def _chat_to_return(chat: Chat) -> ReturnChat:
     return ReturnChat(
