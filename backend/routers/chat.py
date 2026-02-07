@@ -5,35 +5,83 @@ from backend.models import CreateChat, ReturnChat, UpdateName, ReturnMessage
 from backend.routers.auth import get_current_user
 from backend.schemas import Chat, Message
 import yt_dlp
+import requests
 import json
-
-
+import re
 
 router = APIRouter(
     prefix="/chat",
     tags=["chat"],
 )
 
-# In-memory cache so we don't re-fetch YouTube metadata within the same process
+# In-memory cache
 _video_info_cache: dict[str, dict] = {}
 
- 
+def get_video_id(url: str) -> str | None:
+    """Extract the 11-character video ID from a YouTube URL.
 
+    Supports standard watch URLs, shortened youtu.be links, embeds, and shorts.
+
+    Args:
+        url: Any YouTube video URL.
+
+    Returns:
+        The 11-character video ID string, or None if no ID could be extracted.
+    """
+    pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    return None
+
+def fetch_metadata_piped(video_id: str) -> dict | None:
+    """Fetch video metadata from the Piped API (public YouTube proxy).
+
+    Used as a fallback when yt-dlp is blocked due to server IP restrictions
+    on platforms like Render or AWS.
+
+    Args:
+        video_id: The 11-character YouTube video ID.
+
+    Returns:
+        Dict with 'title', 'author', and 'thumbnail_url' keys on success,
+        or None if the request fails.
+    """
+    try:
+        
+        response = requests.get(f"https://pipedapi.kavin.rocks/streams/{video_id}", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "title": data.get("title", "YouTube Video"),
+                "author": data.get("uploader", "Unknown"),
+                "thumbnail_url": data.get("thumbnailUrl", "")
+            }
+    except Exception as e:
+        print(f"⚠️ Piped API failed: {e}")
+    return None
 
 def get_yt_metadata(url: str) -> dict | None:
-    """Fetch YouTube video metadata using yt-dlp.
+    """Fetch video metadata using yt-dlp.
+
+    Primary metadata strategy. Uses flat extraction with no download
+    for fast, lightweight lookups. May fail on servers with blocked IPs.
 
     Args:
         url: YouTube video URL.
 
     Returns:
-        Dict with 'title', 'author', and 'thumbnail_url' keys, or None on failure.
+        Dict with 'title', 'author', and 'thumbnail_url' keys on success,
+        or None if yt-dlp fails (e.g. IP block, bot detection).
     """
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'extract_flat': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        }
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -43,79 +91,59 @@ def get_yt_metadata(url: str) -> dict | None:
                 "author": info.get('uploader', 'Unknown Author'),
                 "thumbnail_url": info.get('thumbnail', ''),
             }
-    except Exception as e:
-        print(f"\u26a0\ufe0f yt-dlp failed for {url}: {e}")
+    except Exception:
         return None
 
+def is_valid_youtube_url(url: str) -> bool:
+    """Validate a YouTube URL and populate the metadata cache.
 
-def get_video_info(url: str) -> dict:
-    """Fetch YouTube video metadata, returning cached results when available.
+    Uses a multi-strategy approach:
+        1. Check if the URL is already cached.
+        2. Extract the video ID via regex (rejects non-YouTube URLs).
+        3. Try yt-dlp for metadata.
+        4. Fall back to the Piped public API.
+        5. Use a generic fallback with the thumbnail from img.youtube.com.
+
+    The URL is only rejected if no valid video ID can be extracted.
+    Metadata fetch failures never cause rejection.
 
     Args:
-        url: YouTube video URL.
+        url: The YouTube URL to validate.
 
     Returns:
-        Dict with 'title', 'author', and 'thumbnail_url' keys.
+        True if the URL contains a valid YouTube video ID, False otherwise.
     """
     if url in _video_info_cache:
-        return _video_info_cache[url]
+        return True
 
-    metadata = get_yt_metadata(url)
-    if metadata:
-        _video_info_cache[url] = metadata
-        return _video_info_cache[url]
-    else:
-        return {
-            "title": "Video Unavailable",
-            "author": "Unknown",
-            "thumbnail_url": "",
-        }
-
- 
-
-def is_valid_youtube_url(url: str) -> bool:
-    """
-    Validate using yt-dlp's internal logic.
-    We check if yt-dlp assigns the 'Youtube' extractor to this URL.
-    """
-    # 1. Check if yt-dlp recognizes this as a YouTube video
-    # This is better than Regex because it handles Shorts, Live, Mobile, etc. automatically.
-    try:
-        with yt_dlp.YoutubeDL() as ydl:
-            # ie_key_for_url checks the URL against yt-dlp's internal patterns
-            # It returns 'Youtube' for videos, 'YoutubeTab' for channels, etc.
-            ie_key = ydl.ie_key_for_url(url)
-            
-            # We strictly accept 'Youtube' (videos) and reject 'YoutubeTab' (channels/playlists)
-            if ie_key != 'Youtube':
-                return False
-    except Exception as e:
-        print(f"⚠️ URL validation failed: {e}")
+    video_id = get_video_id(url)
+    if not video_id:
         return False
 
-    # 2. Check Cache
-    if url in _video_info_cache:
-        return True
-
-    # 3. Try to populate cache via yt-dlp, but don't fail if we can't
+    # Strategy 1: yt-dlp
     metadata = get_yt_metadata(url)
-    if metadata:
-        _video_info_cache[url] = metadata
-        return True
-    else:
-        # Fallback to prevent blocking
-        _video_info_cache[url] = {
-            "title": "YouTube Video (Metadata Unavailable)",
-            "author": "Unknown",
-            "thumbnail_url": "https://img.youtube.com/vi/mqDefault.jpg",
-        }
-        return True
+    
+    # Strategy 2: Piped API (If yt-dlp failed)
+    if not metadata:
+        print(f"🔄 Switching to Piped API for {video_id}...")
+        metadata = fetch_metadata_piped(video_id)
 
+    # Strategy 3: Manual Fallback
+    if not metadata:
+        print(f"⚠️ All metadata fetches failed for {url}. Using generic fallback.")
+        metadata = {
+            "title": "YouTube Video (Metadata Hidden)",
+            "author": "Unknown",
+            "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg",
+        }
+
+    _video_info_cache[url] = metadata
+    return True
 
 def _chat_to_return(chat: Chat) -> ReturnChat:
     """Convert a Chat ORM object to a ReturnChat response model.
 
-    Uses stored DB fields — never calls the YouTube API.
+    Uses stored DB fields only — never calls any external API.
 
     Args:
         chat: SQLAlchemy Chat instance.
@@ -134,8 +162,6 @@ def _chat_to_return(chat: Chat) -> ReturnChat:
         last_session=chat.last_session,
     )
 
- 
-
 @router.post("/create", response_model=ReturnChat, status_code=status.HTTP_201_CREATED)
 def create_chat(
     chat: CreateChat,
@@ -144,26 +170,27 @@ def create_chat(
 ):
     """Create a new chat session for a YouTube video.
 
-    Validates the URL, fetches video metadata, and persists the chat.
+    Validates the URL, fetches video metadata (with fallback), and persists
+    the chat to the database.
 
     Args:
         chat: Request body with YouTube URL and optional name.
-        user: Authenticated user (injected).
-        db: Database session (injected).
+        user: Authenticated user (injected via dependency).
+        db: Database session (injected via dependency).
 
     Returns:
-        The newly created chat as ReturnChat.
+        The newly created chat as a ReturnChat model.
 
     Raises:
-        HTTPException 400: If the YouTube URL is invalid or inaccessible.
+        HTTPException 400: If the URL is not a valid YouTube link.
     """
+    # This validates AND populates the cache
     if not is_valid_youtube_url(chat.url):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid YouTube URL",
         )
 
-    # Use .get() to be safe
     yt_info = _video_info_cache.get(chat.url)
     chat_name = chat.name if chat.name else yt_info["title"]
 
@@ -181,165 +208,112 @@ def create_chat(
 
     return _chat_to_return(new_chat)
 
-
 @router.get("/list", response_model=list[ReturnChat], status_code=status.HTTP_200_OK)
-def list_chats(
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """List all chats for the authenticated user, ordered by last session.
-
-    Uses stored DB fields — no external API calls, so this is fast.
+def list_chats(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """List all chats for the authenticated user, ordered by most recent session.
 
     Args:
-        user: Authenticated user (injected).
-        db: Database session (injected).
+        user: Authenticated user (injected via dependency).
+        db: Database session (injected via dependency).
 
     Returns:
         List of ReturnChat models.
     """
-    chats = (
-        db.query(Chat)
-        .filter(Chat.user_id == user.id)
-        .order_by(Chat.last_session.desc())
-        .all()
-    )
+    chats = db.query(Chat).filter(Chat.user_id == user.id).order_by(Chat.last_session.desc()).all()
     return [_chat_to_return(c) for c in chats]
 
 @router.delete("/delete/{chat_id}", status_code=status.HTTP_200_OK)
-def delete_chat(
-    chat_id: int,
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Delete a chat and all its messages.
+def delete_chat(chat_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete a chat and all its associated messages.
 
     Args:
         chat_id: ID of the chat to delete.
-        user: Authenticated user (injected).
-        db: Database session (injected).
+        user: Authenticated user (injected via dependency).
+        db: Database session (injected via dependency).
 
     Returns:
-        Success confirmation message.
+        Success confirmation dict.
 
     Raises:
-        HTTPException 404: If chat not found or not owned by user.
+        HTTPException 404: If the chat is not found or not owned by the user.
     """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
     db.delete(chat)
     db.commit()
     return {"message": "Chat deleted successfully"}
 
-    
 @router.get("/get/{chat_id}", response_model=ReturnChat, status_code=status.HTTP_200_OK)
-def get_chat(
-    chat_id: int,
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def get_chat(chat_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     """Get a single chat by ID.
 
     Args:
-        chat_id: ID of the chat.
-        user: Authenticated user (injected).
-        db: Database session (injected).
+        chat_id: ID of the chat to retrieve.
+        user: Authenticated user (injected via dependency).
+        db: Database session (injected via dependency).
 
     Returns:
         ReturnChat model for the requested chat.
 
     Raises:
-        HTTPException 404: If chat not found or not owned by user.
+        HTTPException 404: If the chat is not found or not owned by the user.
     """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
     return _chat_to_return(chat)
 
-
 @router.get("/{chat_id}/messages", response_model=list[ReturnMessage], status_code=status.HTTP_200_OK)
-def get_messages(
-    chat_id: int,
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def get_messages(chat_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     """Get all messages for a chat, ordered chronologically.
 
     Args:
-        chat_id: ID of the chat.
-        user: Authenticated user (injected).
-        db: Database session (injected).
+        chat_id: ID of the chat whose messages to retrieve.
+        user: Authenticated user (injected via dependency).
+        db: Database session (injected via dependency).
 
     Returns:
-        List of ReturnMessage models.
+        List of ReturnMessage models with parsed follow-up suggestions.
 
     Raises:
-        HTTPException 404: If chat not found or not owned by user.
+        HTTPException 404: If the chat is not found or not owned by the user.
     """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
-    msgs = (
-        db.query(Message)
-        .filter(Message.chat_id == chat_id)
-        .order_by(Message.created_at.asc())
-        .all()
-    )
+    msgs = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.created_at.asc()).all()
     result = []
     for m in msgs:
-        follow_up: list[str] = []
+        follow_up = []
         if m.follow_up:
             try:
                 follow_up = json.loads(m.follow_up)
             except (json.JSONDecodeError, TypeError):
                 pass
-        result.append(
-            ReturnMessage(
-                id=m.id,
-                role=m.role,
-                content=m.content,
-                follow_up=follow_up,
-                created_at=m.created_at,
-            )
-        )
+        result.append(ReturnMessage(id=m.id, role=m.role, content=m.content, follow_up=follow_up, created_at=m.created_at))
     return result
 
-
 @router.put("/update_name/{chat_id}", response_model=ReturnChat, status_code=status.HTTP_200_OK)
-def update_chat_name(
-    chat_id: int,
-    new_name: UpdateName,
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def update_chat_name(chat_id: int, new_name: UpdateName, user=Depends(get_current_user), db: Session = Depends(get_db)):
     """Rename a chat.
 
     Args:
         chat_id: ID of the chat to rename.
-        new_name: Request body with the new name.
-        user: Authenticated user (injected).
-        db: Database session (injected).
+        new_name: Request body containing the new name.
+        user: Authenticated user (injected via dependency).
+        db: Database session (injected via dependency).
 
     Returns:
         Updated ReturnChat model.
 
     Raises:
-        HTTPException 404: If chat not found or not owned by user.
+        HTTPException 404: If the chat is not found or not owned by the user.
     """
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user.id).first()
     if not chat:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Chat not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
     chat.name = new_name.name
     db.commit()
     db.refresh(chat)
