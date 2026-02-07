@@ -13,6 +13,7 @@ import yt_dlp
 import requests
 import re
 import os
+import json
 
 load_dotenv()
 
@@ -73,9 +74,24 @@ def release_vector_store(url: str):
 
 def get_transcript_text(url: str) -> str:
     """
-    Robust transcript fetcher using yt-dlp.
-    Bypasses IP blocks by extracting the transcript URL directly.
+    Robust transcript fetcher using yt-dlp with Cookie support.
+    Bypasses IP blocks by injecting cookies and extracting the transcript URL directly.
     """
+    # 1. Locate cookies.txt
+    # We check multiple possible locations to support both Windows (Local) and Linux (Render)
+    possible_paths = [
+        "backend/cookies.txt",  # Standard location from root
+        "cookies.txt",          # Inside backend folder
+        os.path.join(os.getcwd(), "backend", "cookies.txt"), # Absolute path
+    ]
+    
+    cookie_file = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            cookie_file = path
+            print(f"[COOKIES] Found cookies at: {path}")
+            break
+    
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -84,6 +100,11 @@ def get_transcript_text(url: str) -> str:
         'writeautomaticsub': True,   # Check for auto-generated subs
         # We don't write files, we just want the info dict
     }
+
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+    else:
+        print("⚠️ [COOKIES] Warning: cookies.txt not found! You may get blocked.")
 
     print(f"[TRANSCRIPT] Fetching metadata via yt-dlp for {url}...")
     try:
