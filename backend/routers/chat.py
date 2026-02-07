@@ -4,11 +4,9 @@ from backend.db import get_db
 from backend.models import CreateChat, ReturnChat, UpdateName, ReturnMessage
 from backend.routers.auth import get_current_user
 from backend.schemas import Chat, Message
-from pytubefix import YouTube
-from pytubefix.exceptions import VideoUnavailable, VideoPrivate
-import requests
+import yt_dlp
 import json
-import re
+
 
 
 router = APIRouter(
@@ -19,8 +17,35 @@ router = APIRouter(
 # In-memory cache so we don't re-fetch YouTube metadata within the same process
 _video_info_cache: dict[str, dict] = {}
 
-# Regex pattern for YouTube URLs (handles Shorts, Mobile, Live, and varied query params)
-YOUTUBE_REGEX = r"^(?:https?://)?(?:www\.|m\.)?(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=|shorts/|live/))([\w-]{11})"
+ 
+
+
+def get_yt_metadata(url: str) -> dict | None:
+    """Fetch YouTube video metadata using yt-dlp.
+
+    Args:
+        url: YouTube video URL.
+
+    Returns:
+        Dict with 'title', 'author', and 'thumbnail_url' keys, or None on failure.
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                "title": info.get('title', 'YouTube Video'),
+                "author": info.get('uploader', 'Unknown Author'),
+                "thumbnail_url": info.get('thumbnail', ''),
+            }
+    except Exception as e:
+        print(f"\u26a0\ufe0f yt-dlp failed for {url}: {e}")
+        return None
 
 
 def get_video_info(url: str) -> dict:
@@ -35,95 +60,56 @@ def get_video_info(url: str) -> dict:
     if url in _video_info_cache:
         return _video_info_cache[url]
 
-    try:
-        yt = YouTube(url)
-        _video_info_cache[url] = {
-            "title": yt.title,
-            "author": yt.author,
-            "thumbnail_url": yt.thumbnail_url,
-        }
+    metadata = get_yt_metadata(url)
+    if metadata:
+        _video_info_cache[url] = metadata
         return _video_info_cache[url]
-    except Exception as e:
-        print(f"Error fetching video info for {url}: {e}")
+    else:
         return {
             "title": "Video Unavailable",
             "author": "Unknown",
             "thumbnail_url": "",
         }
 
-
-# def is_valid_youtube_url(url: str) -> bool:
-#     """Validate a YouTube URL by checking format and attempting to access the video.
-#
-#     First checks the URL matches a known YouTube pattern. Then tries to fetch
-#     metadata via pytubefix — but only rejects the URL if the video is confirmed
-#     unavailable or private. Network/bot-detection errors are treated as
-#     "probably valid" so real URLs aren't rejected on flaky connections.
-#
-#     Also populates the video info cache on success.
-#
-#     Args:
-#         url: YouTube video URL to validate.
-#
-#     Returns:
-#         True if the URL looks valid, False otherwise.
-#     """
-#     yt_pattern = re.compile(
-#         r"^(https?://)?(www\.)?"
-#         r"(youtube\.com/(watch\?.*v=|embed/|v/|shorts/)"
-#         r"|youtu\.be/)"
-#         r"[\w-]{11}"
-#     )
-#     if not yt_pattern.search(url):
-#         return False
-#
-#     try:
-#         yt = YouTube(url)
-#         _video_info_cache[url] = {
-#             "title": yt.title,
-#             "author": yt.author,
-#             "thumbnail_url": yt.thumbnail_url,
-#         }
-#         return True
-#     except VideoUnavailable:
-#         print(f"Error: {url} is unavailable.")
-#         return False
-#     except VideoPrivate:
-#         print(f"Error: {url} is a private video.")
-#         return False
-#     except Exception as e:
-#         print(f"Warning: could not verify {url} ({e}), allowing anyway.")
-#         return True
-
+ 
 
 def is_valid_youtube_url(url: str) -> bool:
     """
-    Validate URL format using Regex.
-    We do NOT fail on metadata fetch to avoid blocking the user due to IP bans.
+    Validate using yt-dlp's internal logic.
+    We check if yt-dlp assigns the 'Youtube' extractor to this URL.
     """
-    # 1. Check if it looks like a YouTube URL
-    if not re.search(YOUTUBE_REGEX, url):
+    # 1. Check if yt-dlp recognizes this as a YouTube video
+    # This is better than Regex because it handles Shorts, Live, Mobile, etc. automatically.
+    try:
+        with yt_dlp.YoutubeDL() as ydl:
+            # ie_key_for_url checks the URL against yt-dlp's internal patterns
+            # It returns 'Youtube' for videos, 'YoutubeTab' for channels, etc.
+            ie_key = ydl.ie_key_for_url(url)
+            
+            # We strictly accept 'Youtube' (videos) and reject 'YoutubeTab' (channels/playlists)
+            if ie_key != 'Youtube':
+                return False
+    except Exception as e:
+        print(f"⚠️ URL validation failed: {e}")
         return False
 
-    # 2. Try to populate cache, but don't fail if we can't
-    try:
-        if url not in _video_info_cache:
-            yt = YouTube(url)
-            _video_info_cache[url] = {
-                "title": yt.title,
-                "author": yt.author,
-                "thumbnail_url": yt.thumbnail_url,
-            }
-    except Exception as e:
-        print(f"⚠️ Metadata fetch failed for {url} (likely IP block): {e}")
-        # Use fallback data so the app continues
+    # 2. Check Cache
+    if url in _video_info_cache:
+        return True
+
+    # 3. Try to populate cache via yt-dlp, but don't fail if we can't
+    metadata = get_yt_metadata(url)
+    if metadata:
+        _video_info_cache[url] = metadata
+        return True
+    else:
+        # Fallback to prevent blocking
         _video_info_cache[url] = {
             "title": "YouTube Video (Metadata Unavailable)",
             "author": "Unknown",
             "thumbnail_url": "https://img.youtube.com/vi/mqDefault.jpg",
         }
-
-    return True
+        return True
 
 
 def _chat_to_return(chat: Chat) -> ReturnChat:
@@ -171,19 +157,14 @@ def create_chat(
     Raises:
         HTTPException 400: If the YouTube URL is invalid or inaccessible.
     """
-    # This will now pass even if metadata fetch fails, as long as the URL looks valid
     if not is_valid_youtube_url(chat.url):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid YouTube URL",
         )
 
-    # _video_info_cache is guaranteed to have data (real or fallback)
-    yt_info = _video_info_cache.get(chat.url, {
-        "title": "YouTube Video",
-        "author": "Unknown",
-        "thumbnail_url": "",
-    })
+    # Use .get() to be safe
+    yt_info = _video_info_cache.get(chat.url)
     chat_name = chat.name if chat.name else yt_info["title"]
 
     new_chat = Chat(
