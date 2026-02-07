@@ -8,6 +8,7 @@ from pytubefix import YouTube
 from pytubefix.exceptions import VideoUnavailable, VideoPrivate
 import requests
 import json
+import re
 
 
 router = APIRouter(
@@ -49,7 +50,12 @@ def get_video_info(url: str) -> dict:
 
 
 def is_valid_youtube_url(url: str) -> bool:
-    """Validate a YouTube URL by attempting to access the video.
+    """Validate a YouTube URL by checking format and attempting to access the video.
+
+    First checks the URL matches a known YouTube pattern. Then tries to fetch
+    metadata via pytubefix — but only rejects the URL if the video is confirmed
+    unavailable or private. Network/bot-detection errors are treated as
+    "probably valid" so real URLs aren't rejected on flaky connections.
 
     Also populates the video info cache on success.
 
@@ -57,8 +63,19 @@ def is_valid_youtube_url(url: str) -> bool:
         url: YouTube video URL to validate.
 
     Returns:
-        True if the video is accessible, False otherwise.
+        True if the URL looks valid, False otherwise.
     """
+    # ── 1. Quick format check ──
+    yt_pattern = re.compile(
+        r"^(https?://)?(www\.)?"
+        r"(youtube\.com/(watch\?.*v=|embed/|v/|shorts/)"
+        r"|youtu\.be/)"
+        r"[\w-]{11}"
+    )
+    if not yt_pattern.search(url):
+        return False
+
+    # ── 2. Try fetching metadata (best-effort) ──
     try:
         yt = YouTube(url)
         _video_info_cache[url] = {
@@ -73,12 +90,10 @@ def is_valid_youtube_url(url: str) -> bool:
     except VideoPrivate:
         print(f"Error: {url} is a private video.")
         return False
-    except requests.exceptions.RequestException as e:
-        print(f"Network error or bot detection: {e}")
-        return False
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return False
+        # Network hiccup / bot detection — URL format is valid, so allow it
+        print(f"Warning: could not verify {url} ({e}), allowing anyway.")
+        return True
 
 
 def _chat_to_return(chat: Chat) -> ReturnChat:
