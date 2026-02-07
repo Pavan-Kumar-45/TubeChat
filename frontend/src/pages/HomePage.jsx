@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { chats as chatsApi } from '../lib/api';
 import { useChats } from '../context/ChatContext';
-import { Youtube, Sparkles, ArrowRight, Loader2 } from 'lucide-react';
+import { Youtube, ArrowRight, Loader2 } from 'lucide-react';
 
 /**
  * Landing page where users paste a YouTube URL to start a new chat.
@@ -54,7 +54,7 @@ export default function HomePage() {
           <div className="flex items-center gap-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-xl px-4 py-3 focus-within:border-[var(--color-accent)] transition-colors">
             <Youtube size={18} className="text-red-500 shrink-0" />
             <input
-              type="url"
+              type="text"
               value={url}
               onChange={e => setUrl(e.target.value)}
               placeholder="https://youtube.com/watch?v=..."
@@ -71,24 +71,6 @@ export default function HomePage() {
           </div>
           {error && <p className="text-sm text-red-500">{error}</p>}
         </form>
-
-        {/* Features */}
-        <div className="grid grid-cols-2 gap-3 text-left">
-          {[
-            ['Ask questions', 'Get answers from video content'],
-            ['Follow-ups', 'AI suggests related questions'],
-            ['Web search', 'Falls back to the web when needed'],
-            ['Markdown', 'Formatted responses with code blocks'],
-          ].map(([title, desc]) => (
-            <div key={title} className="p-3 rounded-xl bg-[var(--color-surface)] border border-[var(--color-border)] space-y-1">
-              <p className="text-sm font-medium flex items-center gap-1.5">
-                <Sparkles size={12} className="text-[var(--color-accent)]" />
-                {title}
-              </p>
-              <p className="text-xs text-[var(--color-text-secondary)]">{desc}</p>
-            </div>
-          ))}
-        </div>
       </div>
     </div>
   );
