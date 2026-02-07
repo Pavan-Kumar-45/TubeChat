@@ -19,6 +19,9 @@ router = APIRouter(
 # In-memory cache so we don't re-fetch YouTube metadata within the same process
 _video_info_cache: dict[str, dict] = {}
 
+# Regex pattern for YouTube URLs
+YOUTUBE_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+
 
 def get_video_info(url: str) -> dict:
     """Fetch YouTube video metadata, returning cached results when available.
@@ -49,51 +52,78 @@ def get_video_info(url: str) -> dict:
         }
 
 
+# def is_valid_youtube_url(url: str) -> bool:
+#     """Validate a YouTube URL by checking format and attempting to access the video.
+#
+#     First checks the URL matches a known YouTube pattern. Then tries to fetch
+#     metadata via pytubefix — but only rejects the URL if the video is confirmed
+#     unavailable or private. Network/bot-detection errors are treated as
+#     "probably valid" so real URLs aren't rejected on flaky connections.
+#
+#     Also populates the video info cache on success.
+#
+#     Args:
+#         url: YouTube video URL to validate.
+#
+#     Returns:
+#         True if the URL looks valid, False otherwise.
+#     """
+#     yt_pattern = re.compile(
+#         r"^(https?://)?(www\.)?"
+#         r"(youtube\.com/(watch\?.*v=|embed/|v/|shorts/)"
+#         r"|youtu\.be/)"
+#         r"[\w-]{11}"
+#     )
+#     if not yt_pattern.search(url):
+#         return False
+#
+#     try:
+#         yt = YouTube(url)
+#         _video_info_cache[url] = {
+#             "title": yt.title,
+#             "author": yt.author,
+#             "thumbnail_url": yt.thumbnail_url,
+#         }
+#         return True
+#     except VideoUnavailable:
+#         print(f"Error: {url} is unavailable.")
+#         return False
+#     except VideoPrivate:
+#         print(f"Error: {url} is a private video.")
+#         return False
+#     except Exception as e:
+#         print(f"Warning: could not verify {url} ({e}), allowing anyway.")
+#         return True
+
+
 def is_valid_youtube_url(url: str) -> bool:
-    """Validate a YouTube URL by checking format and attempting to access the video.
-
-    First checks the URL matches a known YouTube pattern. Then tries to fetch
-    metadata via pytubefix — but only rejects the URL if the video is confirmed
-    unavailable or private. Network/bot-detection errors are treated as
-    "probably valid" so real URLs aren't rejected on flaky connections.
-
-    Also populates the video info cache on success.
-
-    Args:
-        url: YouTube video URL to validate.
-
-    Returns:
-        True if the URL looks valid, False otherwise.
     """
-    # ── 1. Quick format check ──
-    yt_pattern = re.compile(
-        r"^(https?://)?(www\.)?"
-        r"(youtube\.com/(watch\?.*v=|embed/|v/|shorts/)"
-        r"|youtu\.be/)"
-        r"[\w-]{11}"
-    )
-    if not yt_pattern.search(url):
+    Validate URL format using Regex.
+    We do NOT fail on metadata fetch to avoid blocking the user due to IP bans.
+    """
+    # 1. Check if it looks like a YouTube URL
+    if not re.match(YOUTUBE_REGEX, url):
         return False
 
-    # ── 2. Try fetching metadata (best-effort) ──
+    # 2. Try to populate cache, but don't fail if we can't
     try:
-        yt = YouTube(url)
-        _video_info_cache[url] = {
-            "title": yt.title,
-            "author": yt.author,
-            "thumbnail_url": yt.thumbnail_url,
-        }
-        return True
-    except VideoUnavailable:
-        print(f"Error: {url} is unavailable.")
-        return False
-    except VideoPrivate:
-        print(f"Error: {url} is a private video.")
-        return False
+        if url not in _video_info_cache:
+            yt = YouTube(url)
+            _video_info_cache[url] = {
+                "title": yt.title,
+                "author": yt.author,
+                "thumbnail_url": yt.thumbnail_url,
+            }
     except Exception as e:
-        # Network hiccup / bot detection — URL format is valid, so allow it
-        print(f"Warning: could not verify {url} ({e}), allowing anyway.")
-        return True
+        print(f"⚠️ Metadata fetch failed for {url} (likely IP block): {e}")
+        # Use fallback data so the app continues
+        _video_info_cache[url] = {
+            "title": "YouTube Video (Metadata Unavailable)",
+            "author": "Unknown",
+            "thumbnail_url": "https://img.youtube.com/vi/mqDefault.jpg",
+        }
+
+    return True
 
 
 def _chat_to_return(chat: Chat) -> ReturnChat:
@@ -141,13 +171,19 @@ def create_chat(
     Raises:
         HTTPException 400: If the YouTube URL is invalid or inaccessible.
     """
+    # This will now pass even if metadata fetch fails, as long as the URL looks valid
     if not is_valid_youtube_url(chat.url):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid YouTube URL",
         )
 
-    yt_info = _video_info_cache[chat.url]
+    # _video_info_cache is guaranteed to have data (real or fallback)
+    yt_info = _video_info_cache.get(chat.url, {
+        "title": "YouTube Video",
+        "author": "Unknown",
+        "thumbnail_url": "",
+    })
     chat_name = chat.name if chat.name else yt_info["title"]
 
     new_chat = Chat(
