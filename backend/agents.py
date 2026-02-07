@@ -1,7 +1,7 @@
 from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import YoutubeLoader
+from langchain_core.documents import Document
 from dotenv import load_dotenv
 from langchain_tavily import TavilySearch
 from typing import TypedDict, Annotated, Sequence
@@ -9,6 +9,9 @@ from operator import add as add_messages
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from datetime import datetime
 from backend.models import JudgeEval, Output
+import yt_dlp
+import requests
+import re
 import os
 
 load_dotenv()
@@ -18,7 +21,7 @@ tavily_key = os.getenv('tavily_key')
 
 llm = ChatGoogleGenerativeAI(
     api_key=api_key,
-    model="gemini-2.5-flash-lite"
+    model="gemini-2.0-flash"
 )
 
 embeddings = GoogleGenerativeAIEmbeddings(
@@ -68,20 +71,83 @@ def release_vector_store(url: str):
         print(f"[RELEASE] Cleared vector store for {url}")
 
 
+def get_transcript_text(url: str) -> str:
+    """
+    Robust transcript fetcher using yt-dlp.
+    Bypasses IP blocks by extracting the transcript URL directly.
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'writesubtitles': True,      # Check for manual subs
+        'writeautomaticsub': True,   # Check for auto-generated subs
+        # We don't write files, we just want the info dict
+    }
+
+    print(f"[TRANSCRIPT] Fetching metadata via yt-dlp for {url}...")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # 1. Extract Info
+            info = ydl.extract_info(url, download=False)
+            
+            # 2. Look for subtitles (Manual > Automatic)
+            subs = info.get('subtitles') or info.get('automatic_captions')
+            if not subs:
+                raise ValueError("No subtitles found for this video.")
+
+            # 3. Find English track (en, en-US, etc.)
+            lang = next((l for l in ['en', 'en-US', 'en-orig', 'en-GB'] if l in subs), None)
+            if not lang:
+                # Fallback: take the first available language
+                lang = next(iter(subs))
+                print(f"[TRANSCRIPT] English not found, falling back to: {lang}")
+
+            # 4. Get the JSON3 format URL (easiest to parse)
+            formats = subs[lang]
+            json3_url = next((f['url'] for f in formats if f.get('ext') == 'json3'), None)
+            
+            if not json3_url:
+                # Fallback: Try vtt if json3 isn't listed (rare)
+                json3_url = next((f['url'] for f in formats if f.get('ext') == 'vtt'), None)
+                if not json3_url:
+                    raise ValueError("Could not find a parsable subtitle format.")
+
+            # 5. Download the transcript data
+            print(f"[TRANSCRIPT] Downloading subtitle data from: {json3_url[:50]}...")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            r = requests.get(json3_url, headers=headers)
+            r.raise_for_status()
+
+            # 6. Parse JSON3
+            # Structure: { events: [ { segs: [ { utf8: "text" } ] } ] }
+            try:
+                data = r.json()
+                text_parts = []
+                for event in data.get('events', []):
+                    segs = event.get('segs', [])
+                    for seg in segs:
+                        if 'utf8' in seg:
+                            text_parts.append(seg['utf8'])
+                
+                full_text = "".join(text_parts).replace('\n', ' ')
+                # Basic cleanup
+                full_text = re.sub(r'\s+', ' ', full_text).strip()
+                return full_text
+
+            except Exception:
+                # If json parse fails (maybe it was VTT?), return raw text
+                return r.text
+
+    except Exception as e:
+        print(f"[TRANSCRIPT ERROR] {e}")
+        raise ValueError(f"Failed to fetch transcript: {str(e)}")
+
+
 def get_vector_store(url: str) -> Chroma:
     """Get or create a Chroma vector store for a YouTube video transcript.
-
-    Loads the transcript, splits it into chunks, embeds them, and caches
-    the resulting vector store. Evicts the oldest entry when the cache is full.
-
-    Args:
-        url: YouTube video URL.
-
-    Returns:
-        A Chroma vector store instance.
-
-    Raises:
-        ValueError: If no transcript is available for the video.
     """
     if url in _vector_store_cache:
         print(f"[CACHE HIT] Using cached vector store for {url}")
@@ -89,15 +155,16 @@ def get_vector_store(url: str) -> Chroma:
     
     print(f"[LOADING] Fetching transcript for {url}...")
     try:
-        loader = YoutubeLoader.from_youtube_url(url, add_video_info=False, language=["en", "en-US", "en-GB"])
-        transcript = loader.load()
-        print(f"[LOADED] Got {len(transcript)} document(s)")
+        # Use our custom robust fetcher instead of YoutubeLoader
+        text_content = get_transcript_text(url)
+        print(f"[LOADED] Got transcript length: {len(text_content)} chars")
+        
+        # Create a Document object
+        transcript_docs = [Document(page_content=text_content, metadata={"source": url})]
+        
     except Exception as e:
         print(f"[ERROR] Failed to load transcript: {e}")
         raise
-    
-    if not transcript:
-        raise ValueError("No transcript available for this video")
     
     # Evict oldest if cache is full
     _evict_oldest_vector()
@@ -108,7 +175,7 @@ def get_vector_store(url: str) -> Chroma:
         add_start_index=True,
         separators=["\n\n", "\n", " ", ""]
     )
-    docs = splitter.split_documents(transcript)
+    docs = splitter.split_documents(transcript_docs)
     print(f"[SPLIT] Created {len(docs)} chunks")
     
     vector_store = Chroma.from_documents(
@@ -123,17 +190,7 @@ def get_vector_store(url: str) -> Chroma:
 
 
 def create_retriever_tool(url: str):
-    """Create a retriever node function bound to a specific YouTube video.
-
-    Returns a callable that performs similarity search against the video's
-    vector store and filters results by a relevance threshold.
-
-    Args:
-        url: YouTube video URL to build the retriever for.
-
-    Returns:
-        A function compatible with the LangGraph AgentState interface.
-    """
+    """Create a retriever node function bound to a specific YouTube video."""
     vector_store = get_vector_store(url)
     
     def retriever_tool(state: AgentState) -> AgentState:
@@ -162,18 +219,7 @@ BUFFER_SIZE = 10         # keep last N messages as-is
 
 
 def summarize_history(chat_history: list[dict], existing_summary: str) -> str:
-    """Summarize overflow messages to keep the conversation context compact.
-
-    Merges the new messages with an existing summary into a concise
-    3-5 sentence factual summary using the LLM.
-
-    Args:
-        chat_history: List of message dicts ({role, content}) to summarize.
-        existing_summary: Previously accumulated summary text.
-
-    Returns:
-        Updated summary string.
-    """
+    """Summarize overflow messages to keep the conversation context compact."""
     if not chat_history:
         return existing_summary
     
@@ -198,10 +244,6 @@ Summary:"""
 
 
 def build_chat_context(chat_history: list[dict], summary: str) -> tuple[list[dict], str]:
-    """
-    If history exceeds buffer, summarize the overflow and return trimmed history + updated summary.
-    Returns (trimmed_history, updated_summary).
-    """
     if len(chat_history) <= BUFFER_SIZE:
         return chat_history, summary
     
@@ -214,17 +256,7 @@ def build_chat_context(chat_history: list[dict], summary: str) -> tuple[list[dic
 
 
 def reformulate_query(state: AgentState) -> AgentState:
-    """Rewrite the user's query into a standalone, search-optimized question.
-
-    Resolves pronouns and vague references using conversation history and
-    summary context. Passes through unchanged if no history exists.
-
-    Args:
-        state: Current agent state with question, chat_history, and summary.
-
-    Returns:
-        State update with the reformulated_query field set.
-    """
+    """Rewrite the user's query into a standalone, search-optimized question."""
     question = state["question"]
     chat_history = state.get("chat_history", [])
     summary = state.get("summary", "")
@@ -268,14 +300,6 @@ Reformulated query:"""
 
 
 def router(state: AgentState) -> str:
-    """Route to the next node based on the judge's evaluation.
-
-    Args:
-        state: Current agent state with is_good flag.
-
-    Returns:
-        'GENERATE_ANSWER' if the draft is good, 'SEARCH_TAVILY' otherwise.
-    """
     is_good = state.get("is_good", False)
     
     if is_good:
@@ -285,17 +309,6 @@ def router(state: AgentState) -> str:
 
 
 def search_tavily(state: AgentState) -> AgentState:
-    """Perform a fallback web search using the Tavily API.
-
-    Appends search results to the existing documents list so the
-    final agent has additional context.
-
-    Args:
-        state: Current agent state with question and documents.
-
-    Returns:
-        State update with search results appended to documents.
-    """
     query = state["question"]
     
     tavily_search = TavilySearch(tavily_api_key=tavily_key)
@@ -306,17 +319,7 @@ def search_tavily(state: AgentState) -> AgentState:
 
 
 def agent(state: AgentState) -> AgentState:
-    """Draft an answer using retrieved documents and conversation history.
-
-    Constructs a detailed prompt with transcript context, conversation
-    summary, and recent messages, then invokes the LLM for a draft response.
-
-    Args:
-        state: Current agent state with question, documents, chat_history, summary.
-
-    Returns:
-        State update with the draft answer appended to messages.
-    """
+    """Draft an answer using retrieved documents and conversation history."""
     query = state['question']
     docs = state['documents']
     context_docs = "\n\n".join(docs)
@@ -355,17 +358,6 @@ Instructions:
 
 
 def judge(state: AgentState) -> AgentState:
-    """Evaluate the quality of the draft answer using structured LLM output.
-
-    Determines whether the draft fully and accurately answers the question.
-    If not, provides specific feedback for improvement.
-
-    Args:
-        state: Current agent state with question and draft answer in messages.
-
-    Returns:
-        State update with is_good flag and feedback string.
-    """
     query = state['question']
     draft_answer = state['messages'][-1]
     
@@ -389,17 +381,6 @@ Evaluate this answer:
 
 
 def generate_answer(state: AgentState) -> AgentState:
-    """Generate the final structured response with title, answer, and follow-ups.
-
-    Formats the draft answer into well-structured markdown with a title,
-    the original question, comprehensive answer, and follow-up suggestions.
-
-    Args:
-        state: Current agent state with question and draft answer in messages.
-
-    Returns:
-        State update with the structured Output JSON as a message.
-    """
     question = state["question"]
     draft_answer = state["messages"][-1].content
     
@@ -435,14 +416,4 @@ Formatting rules for the answer field:
 
 
 def final_agent(state: AgentState) -> AgentState:
-    """Draft a revised answer after Tavily fallback search results are available.
-
-    Re-uses the agent function with the enriched document context.
-
-    Args:
-        state: Current agent state with enriched documents from Tavily.
-
-    Returns:
-        State update with the revised draft answer.
-    """
     return agent(state)
