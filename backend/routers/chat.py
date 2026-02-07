@@ -19,8 +19,8 @@ router = APIRouter(
 # In-memory cache so we don't re-fetch YouTube metadata within the same process
 _video_info_cache: dict[str, dict] = {}
 
-# Regex pattern for YouTube URLs
-YOUTUBE_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+# Regex pattern for YouTube URLs (handles Shorts, Mobile, Live, and varied query params)
+YOUTUBE_REGEX = r"^(?:https?://)?(?:www\.|m\.)?(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=|shorts/|live/))([\w-]{11})"
 
 
 def get_video_info(url: str) -> dict:
@@ -102,7 +102,7 @@ def is_valid_youtube_url(url: str) -> bool:
     We do NOT fail on metadata fetch to avoid blocking the user due to IP bans.
     """
     # 1. Check if it looks like a YouTube URL
-    if not re.match(YOUTUBE_REGEX, url):
+    if not re.search(YOUTUBE_REGEX, url):
         return False
 
     # 2. Try to populate cache, but don't fail if we can't
